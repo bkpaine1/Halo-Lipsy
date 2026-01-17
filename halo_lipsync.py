@@ -1,0 +1,660 @@
+"""
+Halo-Lipsy: Native AMD Unified Memory Lip Sync for ComfyUI
+
+Created by: Brent & Claude Code (Anthropic Claude Opus 4.5)
+License: MIT
+Version: 1.0.0
+
+Built for AMD APUs with unified memory (Strix Halo, etc.) but works everywhere.
+No subprocesses, no ghost files, no venv escapes. Just lip sync that works.
+"""
+
+import os
+import sys
+import numpy as np
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pathlib import Path
+from tqdm import tqdm
+
+# Audio processing
+import librosa
+from scipy import signal
+
+# ComfyUI
+import folder_paths
+
+
+# ============================================================================
+# AUDIO PROCESSING
+# ============================================================================
+
+class AudioProcessor:
+    """Mel spectrogram extraction for Wav2Lip"""
+
+    def __init__(self):
+        self.num_mels = 80
+        self.sample_rate = 16000
+        self.n_fft = 800
+        self.hop_size = 200
+        self.win_size = 800
+        self.fmin = 55
+        self.fmax = 7600
+        self.preemphasis = 0.97
+        self.ref_level_db = 20
+        self.min_level_db = -100
+        self.max_abs_value = 4.0
+        self._mel_basis = None
+
+    def load_wav(self, path_or_array, sr=None):
+        if isinstance(path_or_array, (str, Path)):
+            return librosa.core.load(str(path_or_array), sr=sr or self.sample_rate)[0]
+        return path_or_array
+
+    def _preemphasis(self, wav):
+        return signal.lfilter([1, -self.preemphasis], [1], wav)
+
+    def _stft(self, y):
+        return librosa.stft(y=y, n_fft=self.n_fft, hop_length=self.hop_size,
+                           win_length=self.win_size)
+
+    def _build_mel_basis(self):
+        return librosa.filters.mel(sr=self.sample_rate, n_fft=self.n_fft,
+                                   n_mels=self.num_mels, fmin=self.fmin, fmax=self.fmax)
+
+    def _linear_to_mel(self, spectrogram):
+        if self._mel_basis is None:
+            self._mel_basis = self._build_mel_basis()
+        return np.dot(self._mel_basis, spectrogram)
+
+    def _amp_to_db(self, x):
+        min_level = np.exp(self.min_level_db / 20 * np.log(10))
+        return 20 * np.log10(np.maximum(min_level, x))
+
+    def _normalize(self, S):
+        return np.clip((2 * self.max_abs_value) *
+                      ((S - self.min_level_db) / (-self.min_level_db)) - self.max_abs_value,
+                      -self.max_abs_value, self.max_abs_value)
+
+    def melspectrogram(self, wav):
+        D = self._stft(self._preemphasis(wav))
+        S = self._amp_to_db(self._linear_to_mel(np.abs(D))) - self.ref_level_db
+        return self._normalize(S)
+
+
+# ============================================================================
+# WAV2LIP MODEL
+# ============================================================================
+
+class Conv2d(nn.Module):
+    def __init__(self, cin, cout, kernel_size, stride, padding, residual=False):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(cin, cout, kernel_size, stride, padding),
+            nn.BatchNorm2d(cout)
+        )
+        self.act = nn.ReLU()
+        self.residual = residual
+
+    def forward(self, x):
+        out = self.conv_block(x)
+        if self.residual:
+            out += x
+        return self.act(out)
+
+
+class Conv2dTranspose(nn.Module):
+    def __init__(self, cin, cout, kernel_size, stride, padding, output_padding=0):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.ConvTranspose2d(cin, cout, kernel_size, stride, padding, output_padding),
+            nn.BatchNorm2d(cout)
+        )
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        out = self.conv_block(x)
+        return self.act(out)
+
+
+class Wav2LipModel(nn.Module):
+    """Wav2Lip neural network"""
+
+    def __init__(self):
+        super().__init__()
+
+        self.face_encoder_blocks = nn.ModuleList([
+            nn.Sequential(Conv2d(6, 16, kernel_size=7, stride=1, padding=3)),
+            nn.Sequential(Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                         Conv2d(32, 32, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(32, 32, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                         Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                         Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                         Conv2d(256, 256, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(256, 256, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+                         Conv2d(512, 512, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2d(512, 512, kernel_size=3, stride=1, padding=0),
+                         Conv2d(512, 512, kernel_size=1, stride=1, padding=0)),
+        ])
+
+        self.audio_encoder = nn.Sequential(
+            Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            Conv2d(32, 32, kernel_size=3, stride=1, padding=1, residual=True),
+            Conv2d(32, 32, kernel_size=3, stride=1, padding=1, residual=True),
+            Conv2d(32, 64, kernel_size=3, stride=(3, 1), padding=1),
+            Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True),
+            Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True),
+            Conv2d(64, 128, kernel_size=3, stride=3, padding=1),
+            Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True),
+            Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True),
+            Conv2d(128, 256, kernel_size=3, stride=(3, 2), padding=1),
+            Conv2d(256, 256, kernel_size=3, stride=1, padding=1, residual=True),
+            Conv2d(256, 512, kernel_size=3, stride=1, padding=0),
+            Conv2d(512, 512, kernel_size=1, stride=1, padding=0),
+        )
+
+        self.face_decoder_blocks = nn.ModuleList([
+            nn.Sequential(Conv2d(512, 512, kernel_size=1, stride=1, padding=0)),
+            nn.Sequential(Conv2dTranspose(1024, 512, kernel_size=3, stride=1, padding=0),
+                         Conv2d(512, 512, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2dTranspose(1024, 512, kernel_size=3, stride=2, padding=1, output_padding=1),
+                         Conv2d(512, 512, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(512, 512, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2dTranspose(768, 384, kernel_size=3, stride=2, padding=1, output_padding=1),
+                         Conv2d(384, 384, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(384, 384, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2dTranspose(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1),
+                         Conv2d(256, 256, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(256, 256, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2dTranspose(320, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+                         Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True)),
+            nn.Sequential(Conv2dTranspose(160, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+                         Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True),
+                         Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True)),
+        ])
+
+        self.output_block = nn.Sequential(
+            Conv2d(80, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(32, 3, kernel_size=1, stride=1, padding=0),
+            nn.Sigmoid()
+        )
+
+    def forward(self, audio_sequences, face_sequences):
+        B = audio_sequences.size(0)
+        input_dim_size = len(face_sequences.size())
+
+        if input_dim_size > 4:
+            audio_sequences = torch.cat([audio_sequences[:, i] for i in range(audio_sequences.size(1))], dim=0)
+            face_sequences = torch.cat([face_sequences[:, :, i] for i in range(face_sequences.size(2))], dim=0)
+
+        audio_embedding = self.audio_encoder(audio_sequences)
+
+        feats = []
+        x = face_sequences
+        for f in self.face_encoder_blocks:
+            x = f(x)
+            feats.append(x)
+
+        x = audio_embedding
+        for f in self.face_decoder_blocks:
+            x = f(x)
+            x = torch.cat((x, feats[-1]), dim=1)
+            feats.pop()
+
+        x = self.output_block(x)
+
+        if input_dim_size > 4:
+            x = torch.split(x, B, dim=0)
+            outputs = torch.stack(x, dim=2)
+        else:
+            outputs = x
+
+        return outputs
+
+
+# ============================================================================
+# FACE DETECTION (CPU-only for unified memory)
+# ============================================================================
+
+class CPUFaceDetector:
+    """CPU-only face detection using OpenCV Haar cascades"""
+
+    def __init__(self):
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+
+    def detect_faces(self, images):
+        results = []
+        for img in images:
+            if img.dtype != np.uint8:
+                img = (img * 255).astype(np.uint8)
+
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = img
+
+            faces = self.face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+            )
+
+            if len(faces) > 0:
+                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                pad = int(0.1 * max(w, h))
+                x1 = max(0, x - pad)
+                y1 = max(0, y - pad)
+                x2 = min(img.shape[1], x + w + pad)
+                y2 = min(img.shape[0], y + h + pad)
+                results.append((x1, y1, x2, y2))
+            else:
+                results.append(None)
+
+        return results
+
+
+def get_face_detector():
+    """Get face detector - tries S3FD first, falls back to OpenCV"""
+    try:
+        # Try existing Wav2Lip S3FD detector
+        wav2lip_paths = [
+            Path(__file__).parent / "Wav2Lip",
+            Path(__file__).parent.parent / "ComfyUI_wav2lip" / "Wav2Lip",
+        ]
+
+        for wav2lip_path in wav2lip_paths:
+            if wav2lip_path.exists() and str(wav2lip_path) not in sys.path:
+                sys.path.insert(0, str(wav2lip_path))
+
+        from face_detection import FaceAlignment, LandmarksType
+        detector = FaceAlignment(LandmarksType._2D, flip_input=False, device='cpu')
+        return detector, 's3fd'
+    except Exception:
+        return CPUFaceDetector(), 'opencv'
+
+
+# ============================================================================
+# HALO-LIPSY NODE
+# ============================================================================
+
+class HaloLipsy:
+    """
+    Halo-Lipsy: Native AMD Unified Memory Lip Sync
+
+    No subprocesses. No ghost files. No venv escapes.
+    Face detection on CPU, Wav2Lip on GPU (ROCm translates CUDA).
+    Safe tensor casting for unified memory compatibility.
+    """
+
+    _model_cache = {}
+    _face_detector = None
+    _face_detector_type = None
+    _audio_processor = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        checkpoint_paths = []
+        search_paths = [
+            Path(folder_paths.models_dir) / "wav2lip",
+            Path(folder_paths.models_dir) / "Wav2Lip",
+            Path(__file__).parent / "checkpoints",
+            Path(__file__).parent.parent / "ComfyUI_wav2lip" / "Wav2Lip" / "checkpoints",
+        ]
+
+        for search_path in search_paths:
+            if search_path.exists():
+                for f in search_path.glob("*.pth"):
+                    checkpoint_paths.append(str(f))
+
+        checkpoint_options = ["auto"] + checkpoint_paths if checkpoint_paths else ["auto"]
+
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "audio": ("AUDIO",),
+            },
+            "optional": {
+                "checkpoint": (checkpoint_options, {"default": "auto"}),
+                "mode": (["sequential", "repetitive"], {"default": "sequential"}),
+                "face_detect_batch": ("INT", {"default": 4, "min": 1, "max": 32,
+                    "tooltip": "Batch size for face detection (CPU)"}),
+                "inference_batch": ("INT", {"default": 64, "min": 1, "max": 256,
+                    "tooltip": "Batch size for Wav2Lip inference (GPU)"}),
+                "face_padding": ("INT", {"default": 10, "min": 0, "max": 50,
+                    "tooltip": "Padding around detected face in pixels"}),
+                "sync_offset": ("INT", {"default": 0, "min": -10, "max": 10,
+                    "tooltip": "Audio sync offset in frames (negative = audio earlier)"}),
+                "mel_step_multiplier": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05,
+                    "tooltip": "Lip sync timing (>1 = faster mouth)"}),
+                "smooth_box_frames": ("INT", {"default": 5, "min": 1, "max": 15,
+                    "tooltip": "Frames for smoothing face box movement"}),
+                "blend_edges": ("BOOLEAN", {"default": True,
+                    "tooltip": "Feather blend face edges"}),
+                "blend_radius": ("INT", {"default": 5, "min": 1, "max": 20,
+                    "tooltip": "Edge blend radius in pixels"}),
+                "force_cpu": ("BOOLEAN", {"default": False,
+                    "tooltip": "Run all inference on CPU (no VRAM)"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
+    FUNCTION = "lipsync"
+    CATEGORY = "Halo-Lipsy"
+
+    def _find_checkpoint(self, checkpoint_path):
+        if checkpoint_path != "auto" and os.path.exists(checkpoint_path):
+            return checkpoint_path
+
+        search_paths = [
+            Path(__file__).parent / "checkpoints" / "wav2lip_gan.pth",
+            Path(__file__).parent / "checkpoints" / "wav2lip.pth",
+            Path(__file__).parent.parent / "ComfyUI_wav2lip" / "Wav2Lip" / "checkpoints" / "wav2lip_gan.pth",
+            Path(folder_paths.models_dir) / "wav2lip" / "wav2lip_gan.pth",
+        ]
+
+        for path in search_paths:
+            if path.exists():
+                return str(path)
+
+        raise FileNotFoundError(
+            "Wav2Lip checkpoint not found. Please download wav2lip_gan.pth from:\n"
+            "https://github.com/Rudrabha/Wav2Lip\n\n"
+            "Place it in one of these locations:\n"
+            f"  - {Path(__file__).parent}/checkpoints/\n"
+            f"  - {folder_paths.models_dir}/wav2lip/"
+        )
+
+    def _load_model(self, checkpoint_path, force_cpu=False):
+        cache_key = f"{checkpoint_path}_{'cpu' if force_cpu else 'cuda'}"
+
+        if cache_key in self._model_cache:
+            return self._model_cache[cache_key]
+
+        print(f"[Halo-Lipsy] Loading model: {Path(checkpoint_path).name}")
+
+        model = Wav2LipModel()
+        device = torch.device('cpu' if force_cpu else 'cuda')
+
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k.replace('module.', '')] = v
+
+        model.load_state_dict(new_state_dict)
+        model = model.to(device)
+        model.eval()
+
+        self._model_cache[cache_key] = model
+        return model
+
+    def _get_face_detector(self):
+        if self._face_detector is None:
+            self._face_detector, self._face_detector_type = get_face_detector()
+        return self._face_detector, self._face_detector_type
+
+    def _get_audio_processor(self):
+        if self._audio_processor is None:
+            self._audio_processor = AudioProcessor()
+        return self._audio_processor
+
+    def _detect_faces(self, images, batch_size):
+        detector, detector_type = self._get_face_detector()
+        all_results = []
+
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size]
+            if detector_type == 's3fd':
+                batch_np = np.array(batch)
+                if batch_np.max() <= 1.0:
+                    batch_np = (batch_np * 255).astype(np.uint8)
+                results = detector.get_detections_for_batch(batch_np)
+            else:
+                results = detector.detect_faces(batch)
+            all_results.extend(results)
+
+        return all_results
+
+    def _prepare_audio(self, audio_dict):
+        waveform = audio_dict["waveform"]
+        sample_rate = audio_dict["sample_rate"]
+
+        if isinstance(waveform, torch.Tensor):
+            waveform = waveform.float().cpu().numpy()
+
+        if waveform.ndim == 3:
+            waveform = waveform.squeeze(0)
+        if waveform.ndim == 2:
+            if waveform.shape[0] <= 2:
+                waveform = waveform.mean(axis=0)
+            else:
+                waveform = waveform.squeeze()
+
+        if sample_rate != 16000:
+            import torchaudio
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+            waveform = resampler(torch.from_numpy(waveform).float()).numpy()
+
+        if np.abs(waveform).max() > 0:
+            waveform = waveform / np.abs(waveform).max()
+
+        return waveform.astype(np.float32)
+
+    def _get_mel_chunks(self, audio, mel_step_multiplier=1.0):
+        processor = self._get_audio_processor()
+        mel = processor.melspectrogram(audio)
+
+        mel_step_size = 16
+        mel_idx_multiplier = (80.0 / 30.0) * mel_step_multiplier
+
+        mel_chunks = []
+        i = 0
+        while True:
+            start_idx = int(i * mel_idx_multiplier)
+            if start_idx + mel_step_size > mel.shape[1]:
+                mel_chunks.append(mel[:, mel.shape[1] - mel_step_size:])
+                break
+            mel_chunks.append(mel[:, start_idx:start_idx + mel_step_size])
+            i += 1
+
+        return mel_chunks
+
+    def _smooth_boxes(self, boxes, window_size=5):
+        smoothed = []
+        for i in range(len(boxes)):
+            if boxes[i] is None:
+                smoothed.append(None)
+                continue
+
+            start = max(0, i - window_size // 2)
+            end = min(len(boxes), i + window_size // 2 + 1)
+            valid_boxes = [b for b in boxes[start:end] if b is not None]
+
+            if valid_boxes:
+                avg_box = np.mean(valid_boxes, axis=0).astype(int)
+                smoothed.append(tuple(avg_box))
+            else:
+                smoothed.append(boxes[i])
+
+        return smoothed
+
+    def _blend_face(self, frame, face_region, coords, radius=5):
+        y1, y2, x1, x2 = coords
+        h, w = y2 - y1, x2 - x1
+
+        mask = np.ones((h, w), dtype=np.float32)
+        for i in range(radius):
+            alpha = (i + 1) / (radius + 1)
+            if i < h:
+                mask[i, :] = min(mask[i, 0], alpha)
+                mask[-(i+1), :] = min(mask[-(i+1), 0], alpha)
+            if i < w:
+                mask[:, i] = np.minimum(mask[:, i], alpha)
+                mask[:, -(i+1)] = np.minimum(mask[:, -(i+1)], alpha)
+
+        mask = np.stack([mask] * 3, axis=-1)
+        original = frame[y1:y2, x1:x2].astype(np.float32)
+        blended = face_region.astype(np.float32) * mask + original * (1 - mask)
+
+        return blended.astype(np.uint8)
+
+    def lipsync(self, images, audio, checkpoint="auto", mode="sequential",
+                face_detect_batch=4, inference_batch=64, face_padding=10,
+                sync_offset=0, mel_step_multiplier=1.0,
+                smooth_box_frames=5, blend_edges=True, blend_radius=5, force_cpu=False):
+
+        device_str = "CPU" if force_cpu else "GPU"
+        print(f"[Halo-Lipsy] Processing {len(images)} frames on {device_str}")
+
+        checkpoint_path = self._find_checkpoint(checkpoint)
+        model = self._load_model(checkpoint_path, force_cpu=force_cpu)
+        device = next(model.parameters()).device
+
+        if isinstance(images, torch.Tensor):
+            images_np = images.float().cpu().numpy()
+        else:
+            images_np = np.array(images)
+
+        if images_np.max() <= 1.0:
+            images_uint8 = (images_np * 255).astype(np.uint8)
+        else:
+            images_uint8 = images_np.astype(np.uint8)
+
+        audio_wav = self._prepare_audio(audio)
+        mel_chunks = self._get_mel_chunks(audio_wav, mel_step_multiplier=mel_step_multiplier)
+        print(f"[Halo-Lipsy] {len(mel_chunks)} mel chunks")
+
+        print("[Halo-Lipsy] Detecting faces (CPU)...")
+        face_detections = self._detect_faces(list(images_uint8), face_detect_batch)
+        face_detections = self._smooth_boxes(face_detections, window_size=smooth_box_frames)
+
+        valid_detections = [d for d in face_detections if d is not None]
+        if len(valid_detections) == 0:
+            print("[Halo-Lipsy] No faces detected, using full frame")
+            h, w = images_uint8[0].shape[:2]
+            face_detections = [(0, 0, w, h)] * len(images_uint8)
+
+        img_size = 96
+        frame_count = len(images_uint8)
+        repeat_frames = len(mel_chunks) / frame_count if frame_count > 0 else 1
+
+        out_images = []
+        all_data = []
+
+        for mel_idx, mel in enumerate(mel_chunks):
+            adjusted_mel_idx = max(0, mel_idx + sync_offset)
+
+            if mode == "sequential":
+                frame_idx = min(int(adjusted_mel_idx / repeat_frames), frame_count - 1)
+            else:
+                frame_idx = adjusted_mel_idx % frame_count
+
+            detection = face_detections[frame_idx]
+            if detection is None:
+                continue
+
+            x1, y1, x2, y2 = detection
+            h, w = images_uint8[frame_idx].shape[:2]
+            y1 = max(0, y1 - face_padding)
+            y2 = min(h, y2 + face_padding)
+            x1 = max(0, x1)
+            x2 = min(w, x2)
+
+            frame = images_uint8[frame_idx].copy()
+            face = frame[y1:y2, x1:x2]
+            face = cv2.resize(face, (img_size, img_size))
+
+            all_data.append({
+                'face': face,
+                'mel': mel,
+                'frame': frame,
+                'coords': (y1, y2, x1, x2)
+            })
+
+        print(f"[Halo-Lipsy] Processing {len(all_data)} frames through Wav2Lip...")
+
+        for batch_start in tqdm(range(0, len(all_data), inference_batch), desc="Wav2Lip"):
+            batch_end = min(batch_start + inference_batch, len(all_data))
+            batch_data = all_data[batch_start:batch_end]
+
+            img_batch = []
+            mel_batch = []
+
+            for item in batch_data:
+                face = item['face']
+                mel = item['mel']
+
+                img_masked = face.copy()
+                img_masked[img_size//2:] = 0
+                img_concat = np.concatenate((img_masked, face), axis=2) / 255.0
+
+                img_batch.append(img_concat)
+                mel_batch.append(mel.reshape(mel.shape[0], mel.shape[1], 1))
+
+            img_batch = np.array(img_batch)
+            mel_batch = np.array(mel_batch)
+
+            img_tensor = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
+            mel_tensor = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+
+            with torch.no_grad():
+                pred = model(mel_tensor, img_tensor)
+
+            pred = pred.float().cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+
+            for i, item in enumerate(batch_data):
+                p = pred[i]
+                frame = item['frame'].copy()
+                y1, y2, x1, x2 = item['coords']
+
+                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+
+                if blend_edges and blend_radius > 0:
+                    blended = self._blend_face(frame, p, (y1, y2, x1, x2), radius=blend_radius)
+                    frame[y1:y2, x1:x2] = blended
+                else:
+                    frame[y1:y2, x1:x2] = p
+
+                out_images.append(frame)
+
+        print(f"[Halo-Lipsy] Done! {len(out_images)} output frames")
+
+        out_tensor_list = []
+        for img in out_images:
+            img_float = img.astype(np.float32) / 255.0
+            out_tensor_list.append(torch.from_numpy(img_float))
+
+        output_images = torch.stack(out_tensor_list, dim=0)
+
+        return (output_images, audio)
+
+
+# ============================================================================
+# NODE REGISTRATION
+# ============================================================================
+
+NODE_CLASS_MAPPINGS = {
+    "HaloLipsy": HaloLipsy,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "HaloLipsy": "Halo-Lipsy",
+}
+
+# Startup message
+print("[Halo-Lipsy] Loaded - AMD unified memory lip sync by Brent & Claude Code")
+
+__version__ = "1.0.0"
+__author__ = "Brent & Claude Code"
