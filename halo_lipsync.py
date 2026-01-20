@@ -3,7 +3,7 @@ Halo-Lipsy: Native AMD Unified Memory Lip Sync for ComfyUI
 
 Created by: Brent & Claude Code (Anthropic Claude Opus 4.5)
 License: MIT
-Version: 1.0.0
+Version: 1.1.0
 
 Built for AMD APUs with unified memory (Strix Halo, etc.) but works everywhere.
 No subprocesses, no ghost files, no venv escapes. Just lip sync that works.
@@ -326,6 +326,8 @@ class HaloLipsy:
             "optional": {
                 "checkpoint": (checkpoint_options, {"default": "auto"}),
                 "mode": (["sequential", "repetitive"], {"default": "sequential"}),
+                "trim_to_audio": ("BOOLEAN", {"default": True,
+                    "tooltip": "ON = trim video to audio length, OFF = keep full video (no lip sync after audio ends)"}),
                 "face_detect_batch": ("INT", {"default": 4, "min": 1, "max": 32,
                     "tooltip": "Batch size for face detection (CPU)"}),
                 "inference_batch": ("INT", {"default": 64, "min": 1, "max": 256,
@@ -511,7 +513,7 @@ class HaloLipsy:
         return blended.astype(np.uint8)
 
     def lipsync(self, images, audio, checkpoint="auto", mode="sequential",
-                face_detect_batch=4, inference_batch=64, face_padding=10,
+                trim_to_audio=True, face_detect_batch=4, inference_batch=64, face_padding=10,
                 sync_offset=0, mel_step_multiplier=1.0,
                 smooth_box_frames=5, blend_edges=True, blend_radius=5, force_cpu=False):
 
@@ -548,12 +550,29 @@ class HaloLipsy:
 
         img_size = 96
         frame_count = len(images_uint8)
-        repeat_frames = len(mel_chunks) / frame_count if frame_count > 0 else 1
+        mel_count = len(mel_chunks)
 
         out_images = []
         all_data = []
+        passthrough_frames = []  # Frames after audio ends (no lip sync)
 
-        for mel_idx, mel in enumerate(mel_chunks):
+        if trim_to_audio:
+            # Trim video to audio length (original behavior)
+            output_count = mel_count
+            print(f"[Halo-Lipsy] Trimming to audio length ({mel_count} frames)")
+        else:
+            # Keep full video - lip sync only while audio plays
+            output_count = mel_count  # Only process frames that have audio
+            extra_frames = max(0, frame_count - mel_count)
+            if extra_frames > 0:
+                print(f"[Halo-Lipsy] Lip sync for {mel_count} frames, then {extra_frames} frames pass through")
+            else:
+                print(f"[Halo-Lipsy] Audio covers all {frame_count} frames")
+
+        # Calculate frame-to-mel mapping
+        repeat_frames = mel_count / frame_count if frame_count > 0 else 1
+
+        for mel_idx in range(output_count):
             adjusted_mel_idx = max(0, mel_idx + sync_offset)
 
             if mode == "sequential":
@@ -561,6 +580,7 @@ class HaloLipsy:
             else:
                 frame_idx = adjusted_mel_idx % frame_count
 
+            mel = mel_chunks[mel_idx]
             detection = face_detections[frame_idx]
             if detection is None:
                 continue
@@ -582,6 +602,12 @@ class HaloLipsy:
                 'frame': frame,
                 'coords': (y1, y2, x1, x2)
             })
+
+        # Collect pass-through frames (after audio ends, no lip sync)
+        if not trim_to_audio and frame_count > mel_count:
+            # Frames beyond audio duration - keep original (no lip sync)
+            for frame_idx in range(mel_count, frame_count):
+                passthrough_frames.append(images_uint8[frame_idx].copy())
 
         print(f"[Halo-Lipsy] Processing {len(all_data)} frames through Wav2Lip...")
 
@@ -629,7 +655,12 @@ class HaloLipsy:
 
                 out_images.append(frame)
 
-        print(f"[Halo-Lipsy] Done! {len(out_images)} output frames")
+        # Append pass-through frames (no lip sync, original video continues)
+        if passthrough_frames:
+            out_images.extend(passthrough_frames)
+            print(f"[Halo-Lipsy] Done! {len(out_images)} total frames ({len(out_images) - len(passthrough_frames)} synced + {len(passthrough_frames)} pass-through)")
+        else:
+            print(f"[Halo-Lipsy] Done! {len(out_images)} output frames")
 
         out_tensor_list = []
         for img in out_images:
@@ -656,5 +687,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # Startup message
 print("[Halo-Lipsy] Loaded - AMD unified memory lip sync by Brent & Claude Code")
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Brent & Claude Code"
