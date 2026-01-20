@@ -105,7 +105,7 @@ Place it in:
 
 ## Tested On
 
-- **Ryzen AI Max+ 395 (Strix Halo)** - 64GB unified memory
+- **Ryzen AI Max+ 395 (Strix Halo)** - 128GB unified memory split 64/64 ram/vram
 - **ROCm 7.11**
 - **ComfyUI** with HunyuanVideo loaded (15GB+)
 
