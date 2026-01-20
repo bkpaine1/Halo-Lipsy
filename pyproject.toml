@@ -12,3 +12,8 @@ requires-python = ">=3.10"
 [project.urls]
 Homepage = "https://github.com/bkpaine1/Halo-Lipsy"
 Repository = "https://github.com/bkpaine1/Halo-Lipsy"
+
+[tool.comfy]
+PublisherId = "bkpaine1"
+DisplayName = "Halo-Lipsy"
+Icon = "https://raw.githubusercontent.com/bkpaine1/Halo-Lipsy/main/examples/icon.png"
