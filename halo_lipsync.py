@@ -3,7 +3,7 @@ Halo-Lipsy: Native AMD Unified Memory Lip Sync for ComfyUI
 
 Created by: Brent & Claude Code (Anthropic Claude Opus 4.5)
 License: MIT
-Version: 1.1.0
+Version: 1.2.1
 
 Built for AMD APUs with unified memory (Strix Halo, etc.) but works everywhere.
 No subprocesses, no ghost files, no venv escapes. Just lip sync that works.
@@ -223,11 +223,65 @@ class Wav2LipModel(nn.Module):
 
 
 # ============================================================================
-# FACE DETECTION (CPU-only for unified memory)
+# FACE DETECTION
+# Priority: S3FD > MediaPipe > Haar (fallback)
 # ============================================================================
 
+class MediaPipeFaceDetector:
+    """MediaPipe-based face detection - works well on AI-generated faces"""
+
+    def __init__(self):
+        import mediapipe as mp
+        self.mp_face = mp.solutions.face_detection
+        self.detector = self.mp_face.FaceDetection(
+            model_selection=1,  # Full-range model (better for various distances)
+            min_detection_confidence=0.3
+        )
+
+    def detect_faces(self, images):
+        results = []
+        for img in images:
+            if img.dtype != np.uint8:
+                img = (img * 255).astype(np.uint8)
+
+            # MediaPipe expects RGB
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
+            h, w = img.shape[:2]
+            mp_results = self.detector.process(img)
+
+            if mp_results.detections:
+                # Take the highest confidence detection
+                best = max(mp_results.detections, key=lambda d: d.score[0])
+                bbox = best.location_data.relative_bounding_box
+
+                # Convert relative coords to absolute
+                x1 = max(0, int(bbox.xmin * w))
+                y1 = max(0, int(bbox.ymin * h))
+                x2 = min(w, int((bbox.xmin + bbox.width) * w))
+                y2 = min(h, int((bbox.ymin + bbox.height) * h))
+
+                # Expand bbox for better face coverage (Wav2Lip needs forehead context)
+                bw, bh = x2 - x1, y2 - y1
+                expand_w = int(bw * 0.15)
+                expand_h_top = int(bh * 0.3)  # More expansion upward for forehead
+                expand_h_bot = int(bh * 0.1)
+
+                x1 = max(0, x1 - expand_w)
+                y1 = max(0, y1 - expand_h_top)
+                x2 = min(w, x2 + expand_w)
+                y2 = min(h, y2 + expand_h_bot)
+
+                results.append((x1, y1, x2, y2))
+            else:
+                results.append(None)
+
+        return results
+
+
 class CPUFaceDetector:
-    """CPU-only face detection using OpenCV Haar cascades"""
+    """CPU-only face detection using OpenCV Haar cascades (last resort fallback)"""
 
     def __init__(self):
         self.face_cascade = cv2.CascadeClassifier(
@@ -251,7 +305,7 @@ class CPUFaceDetector:
 
             if len(faces) > 0:
                 x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                pad = int(0.1 * max(w, h))
+                pad = int(0.15 * max(w, h))
                 x1 = max(0, x - pad)
                 y1 = max(0, y - pad)
                 x2 = min(img.shape[1], x + w + pad)
@@ -264,23 +318,35 @@ class CPUFaceDetector:
 
 
 def get_face_detector():
-    """Get face detector - tries S3FD first, falls back to OpenCV"""
+    """Get face detector - tries S3FD > MediaPipe > OpenCV Haar"""
+    # Try S3FD first (best quality)
     try:
-        # Try existing Wav2Lip S3FD detector
         wav2lip_paths = [
             Path(__file__).parent / "Wav2Lip",
             Path(__file__).parent.parent / "ComfyUI_wav2lip" / "Wav2Lip",
         ]
-
         for wav2lip_path in wav2lip_paths:
             if wav2lip_path.exists() and str(wav2lip_path) not in sys.path:
                 sys.path.insert(0, str(wav2lip_path))
 
         from face_detection import FaceAlignment, LandmarksType
         detector = FaceAlignment(LandmarksType._2D, flip_input=False, device='cpu')
+        print("[Halo-Lipsy] Face detector: S3FD")
         return detector, 's3fd'
     except Exception:
-        return CPUFaceDetector(), 'opencv'
+        pass
+
+    # Try MediaPipe (good for AI-generated faces)
+    try:
+        detector = MediaPipeFaceDetector()
+        print("[Halo-Lipsy] Face detector: MediaPipe")
+        return detector, 'mediapipe'
+    except Exception:
+        pass
+
+    # Fall back to Haar cascades
+    print("[Halo-Lipsy] Face detector: OpenCV Haar (least reliable)")
+    return CPUFaceDetector(), 'opencv'
 
 
 # ============================================================================
@@ -424,9 +490,12 @@ class HaloLipsy:
                     batch_np = (batch_np * 255).astype(np.uint8)
                 results = detector.get_detections_for_batch(batch_np)
             else:
+                # MediaPipe and OpenCV both use detect_faces()
                 results = detector.detect_faces(batch)
             all_results.extend(results)
 
+        detected = sum(1 for r in all_results if r is not None)
+        print(f"[Halo-Lipsy] Face detection: {detected}/{len(all_results)} frames have faces")
         return all_results
 
     def _prepare_audio(self, audio_dict):
@@ -496,15 +565,28 @@ class HaloLipsy:
         y1, y2, x1, x2 = coords
         h, w = y2 - y1, x2 - x1
 
+        if h <= 0 or w <= 0:
+            return frame[y1:y2, x1:x2]
+
+        # Create smooth Gaussian-based mask for natural blending
         mask = np.ones((h, w), dtype=np.float32)
-        for i in range(radius):
-            alpha = (i + 1) / (radius + 1)
-            if i < h:
-                mask[i, :] = min(mask[i, 0], alpha)
-                mask[-(i+1), :] = min(mask[-(i+1), 0], alpha)
-            if i < w:
-                mask[:, i] = np.minimum(mask[:, i], alpha)
-                mask[:, -(i+1)] = np.minimum(mask[:, -(i+1)], alpha)
+
+        # Apply smooth falloff at edges using a proper distance-based approach
+        effective_radius = min(radius, h // 4, w // 4)
+        if effective_radius > 0:
+            for i in range(effective_radius):
+                # Smooth cosine falloff instead of linear
+                alpha = 0.5 * (1.0 - np.cos(np.pi * (i + 1) / (effective_radius + 1)))
+                if i < h:
+                    mask[i, :] = np.minimum(mask[i, :], alpha)
+                    mask[-(i+1), :] = np.minimum(mask[-(i+1), :], alpha)
+                if i < w:
+                    mask[:, i] = np.minimum(mask[:, i], alpha)
+                    mask[:, -(i+1)] = np.minimum(mask[:, -(i+1)], alpha)
+
+            # Gaussian blur the mask for even smoother transitions
+            ksize = effective_radius * 2 + 1
+            mask = cv2.GaussianBlur(mask, (ksize, ksize), effective_radius / 2)
 
         mask = np.stack([mask] * 3, axis=-1)
         original = frame[y1:y2, x1:x2].astype(np.float32)
@@ -544,9 +626,28 @@ class HaloLipsy:
 
         valid_detections = [d for d in face_detections if d is not None]
         if len(valid_detections) == 0:
-            print("[Halo-Lipsy] No faces detected, using full frame")
-            h, w = images_uint8[0].shape[:2]
-            face_detections = [(0, 0, w, h)] * len(images_uint8)
+            print("[Halo-Lipsy] WARNING: No faces detected in any frame!")
+            print("[Halo-Lipsy] Returning original video unchanged (cannot lip sync without a face)")
+            output_images = torch.from_numpy(images_np.astype(np.float32))
+            if output_images.max() > 1.0:
+                output_images = output_images / 255.0
+            return (output_images, audio)
+
+        # Fill gaps: propagate nearest valid detection to frames with None
+        last_valid = None
+        for i in range(len(face_detections)):
+            if face_detections[i] is not None:
+                last_valid = face_detections[i]
+            elif last_valid is not None:
+                face_detections[i] = last_valid
+        # Backward pass for leading Nones
+        if face_detections[0] is None:
+            first_valid = next(d for d in face_detections if d is not None)
+            for i in range(len(face_detections)):
+                if face_detections[i] is None:
+                    face_detections[i] = first_valid
+                else:
+                    break
 
         img_size = 96
         frame_count = len(images_uint8)
@@ -583,25 +684,38 @@ class HaloLipsy:
             mel = mel_chunks[mel_idx]
             detection = face_detections[frame_idx]
             if detection is None:
+                # No face detected - pass through original frame
+                out_images.append(images_uint8[frame_idx].copy())
                 continue
 
             x1, y1, x2, y2 = detection
             h, w = images_uint8[frame_idx].shape[:2]
             y1 = max(0, y1 - face_padding)
             y2 = min(h, y2 + face_padding)
-            x1 = max(0, x1)
-            x2 = min(w, x2)
+            x1 = max(0, x1 - face_padding)
+            x2 = min(w, x2 + face_padding)
+
+            # Sanity check: face region must be reasonable
+            face_h, face_w = y2 - y1, x2 - x1
+            if face_h < 20 or face_w < 20:
+                out_images.append(images_uint8[frame_idx].copy())
+                continue
 
             frame = images_uint8[frame_idx].copy()
             face = frame[y1:y2, x1:x2]
-            face = cv2.resize(face, (img_size, img_size))
+
+            # Convert RGB→BGR for Wav2Lip (model was trained on BGR)
+            face_bgr = cv2.cvtColor(face, cv2.COLOR_RGB2BGR)
+            face_resized = cv2.resize(face_bgr, (img_size, img_size), interpolation=cv2.INTER_AREA)
 
             all_data.append({
-                'face': face,
+                'face': face_resized,
                 'mel': mel,
                 'frame': frame,
-                'coords': (y1, y2, x1, x2)
+                'coords': (y1, y2, x1, x2),
+                'out_idx': len(out_images)  # Track position for insertion
             })
+            out_images.append(None)  # Placeholder, filled after inference
 
         # Collect pass-through frames (after audio ends, no lip sync)
         if not trim_to_audio and frame_count > mel_count:
@@ -619,11 +733,14 @@ class HaloLipsy:
             mel_batch = []
 
             for item in batch_data:
-                face = item['face']
+                face = item['face']  # Already BGR, already 96x96
                 mel = item['mel']
 
+                # Mask bottom half of face (Wav2Lip regenerates the mouth)
                 img_masked = face.copy()
                 img_masked[img_size//2:] = 0
+
+                # 6-channel input: masked face + original face (both BGR)
                 img_concat = np.concatenate((img_masked, face), axis=2) / 255.0
 
                 img_batch.append(img_concat)
@@ -641,11 +758,16 @@ class HaloLipsy:
             pred = pred.float().cpu().numpy().transpose(0, 2, 3, 1) * 255.0
 
             for i, item in enumerate(batch_data):
-                p = pred[i]
+                p = pred[i].clip(0, 255).astype(np.uint8)
                 frame = item['frame'].copy()
                 y1, y2, x1, x2 = item['coords']
+                target_w, target_h = x2 - x1, y2 - y1
 
-                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+                # Convert model output BGR→RGB (model outputs BGR)
+                p = cv2.cvtColor(p, cv2.COLOR_BGR2RGB)
+
+                # High-quality upscale from 96x96 back to face region size
+                p = cv2.resize(p, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
                 if blend_edges and blend_radius > 0:
                     blended = self._blend_face(frame, p, (y1, y2, x1, x2), radius=blend_radius)
@@ -653,17 +775,29 @@ class HaloLipsy:
                 else:
                     frame[y1:y2, x1:x2] = p
 
-                out_images.append(frame)
+                # Place result at the correct position
+                out_images[item['out_idx']] = frame
 
         # Append pass-through frames (no lip sync, original video continues)
         if passthrough_frames:
             out_images.extend(passthrough_frames)
-            print(f"[Halo-Lipsy] Done! {len(out_images)} total frames ({len(out_images) - len(passthrough_frames)} synced + {len(passthrough_frames)} pass-through)")
+            synced = len(out_images) - len(passthrough_frames)
+            print(f"[Halo-Lipsy] Done! {len(out_images)} total frames ({synced} synced + {len(passthrough_frames)} pass-through)")
         else:
             print(f"[Halo-Lipsy] Done! {len(out_images)} output frames")
 
+        # Safety: filter out any None placeholders (shouldn't happen, but defensive)
+        final_images = []
+        for idx, img in enumerate(out_images):
+            if img is None:
+                # Fallback: use original frame if inference somehow missed this slot
+                frame_idx = min(idx, frame_count - 1)
+                final_images.append(images_uint8[frame_idx].copy())
+            else:
+                final_images.append(img)
+
         out_tensor_list = []
-        for img in out_images:
+        for img in final_images:
             img_float = img.astype(np.float32) / 255.0
             out_tensor_list.append(torch.from_numpy(img_float))
 
@@ -687,5 +821,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # Startup message
 print("[Halo-Lipsy] Loaded - AMD unified memory lip sync by Brent & Claude Code")
 
-__version__ = "1.1.0"
+__version__ = "1.2.1"
 __author__ = "Brent & Claude Code"
