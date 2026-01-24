@@ -741,7 +741,7 @@ class HaloLipsy:
                 temporal_smooth=0.2, force_cpu=False):
 
         device_str = "CPU" if force_cpu else "GPU (FP16)"
-        print(f"[Halo-Lipsy] v2.0 Processing {len(images)} frames @ {fps}fps on {device_str}")
+        print(f"[Halo-Lipsy] v2.1 Processing {len(images)} frames @ {fps}fps on {device_str}")
 
         checkpoint_path = self._find_checkpoint(checkpoint)
         model = self._load_model(checkpoint_path, force_cpu=force_cpu)
@@ -1002,7 +1002,7 @@ class HaloLipsy:
 # NODE REGISTRATION
 # ============================================================================
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Brent & Claude Code"
 
 NODE_CLASS_MAPPINGS = {
