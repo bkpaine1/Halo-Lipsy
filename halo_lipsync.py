@@ -621,39 +621,6 @@ class HaloLipsy:
 
         return smoothed
 
-    def _blend_face(self, frame, face_region, coords, radius=5):
-        y1, y2, x1, x2 = coords
-        h, w = y2 - y1, x2 - x1
-
-        if h <= 0 or w <= 0:
-            return frame[y1:y2, x1:x2]
-
-        # Create smooth Gaussian-based mask for natural blending
-        mask = np.ones((h, w), dtype=np.float32)
-
-        # Apply smooth falloff at edges using a proper distance-based approach
-        effective_radius = min(radius, h // 4, w // 4)
-        if effective_radius > 0:
-            for i in range(effective_radius):
-                # Smooth cosine falloff instead of linear
-                alpha = 0.5 * (1.0 - np.cos(np.pi * (i + 1) / (effective_radius + 1)))
-                if i < h:
-                    mask[i, :] = np.minimum(mask[i, :], alpha)
-                    mask[-(i+1), :] = np.minimum(mask[-(i+1), :], alpha)
-                if i < w:
-                    mask[:, i] = np.minimum(mask[:, i], alpha)
-                    mask[:, -(i+1)] = np.minimum(mask[:, -(i+1)], alpha)
-
-            # Gaussian blur the mask for even smoother transitions
-            ksize = effective_radius * 2 + 1
-            mask = cv2.GaussianBlur(mask, (ksize, ksize), effective_radius / 2)
-
-        mask = np.stack([mask] * 3, axis=-1)
-        original = frame[y1:y2, x1:x2].astype(np.float32)
-        blended = face_region.astype(np.float32) * mask + original * (1 - mask)
-
-        return blended.astype(np.uint8)
-
     def _pad_to_square(self, img):
         """Pad image to square preserving aspect ratio"""
         h, w = img.shape[:2]
@@ -674,34 +641,33 @@ class HaloLipsy:
         return img[pad_h:pad_h + orig_h, pad_w:pad_w + orig_w]
 
     def _gradient_mouth_mask(self, height, width):
-        """Create an elliptical mask targeting only the mouth region with soft feathering"""
+        """Ultra-tight lips-only mask - minimal Wav2Lip area to avoid 96x96 artifacts"""
         mask = np.zeros((height, width), dtype=np.float32)
 
-        # Mouth center: ~70% down the face, horizontally centered
+        # Mouth center: 72% down the face, horizontally centered
         cy = int(height * 0.72)
         cx = width // 2
 
-        # Mouth ellipse: ~30% of face width, ~20% of face height
-        rx = int(width * 0.28)
-        ry = int(height * 0.16)
+        # Just the lips - tight ellipse
+        rx = int(width * 0.25)   # Lip width
+        ry = int(height * 0.09)  # Lip height only
 
         # Create elliptical distance field
         yy, xx = np.ogrid[:height, :width]
         dist = ((xx - cx).astype(np.float32) / max(rx, 1)) ** 2 + \
                ((yy - cy).astype(np.float32) / max(ry, 1)) ** 2
 
-        # Inner region: full replacement (dist < 0.6)
-        # Feather zone: smooth falloff (0.6 to 1.0)
-        inner = 0.6
-        outer = 1.0
+        # Tight core with fast feather falloff
+        inner = 0.4
+        outer = 0.7
         mask[dist <= inner] = 1.0
         feather_zone = (dist > inner) & (dist <= outer)
         t = (dist[feather_zone] - inner) / (outer - inner)
-        mask[feather_zone] = 0.5 * (1.0 + np.cos(np.pi * t))  # Smooth cosine falloff
+        mask[feather_zone] = 0.5 * (1.0 + np.cos(np.pi * t))
 
-        # Gaussian blur for extra-smooth edges
-        ksize = max(3, int(min(height, width) * 0.08) | 1)  # Ensure odd
-        mask = cv2.GaussianBlur(mask, (ksize, ksize), ksize / 3.0)
+        # Minimal anti-alias blur
+        ksize = max(3, int(min(height, width) * 0.03) | 1)
+        mask = cv2.GaussianBlur(mask, (ksize, ksize), ksize / 4.0)
 
         return np.stack([mask] * 3, axis=-1)
 
@@ -735,11 +701,10 @@ class HaloLipsy:
                 trim_to_audio=True, face_detect_batch=4, face_detect_interval=1,
                 inference_batch=64, face_padding=5,
                 sync_offset=0, mel_step_multiplier=1.0,
-                smooth_box_frames=5, temporal_smooth=0.2, force_cpu=False,
-                blend_edges=True, blend_radius=5):
+                smooth_box_frames=5, temporal_smooth=0.2, force_cpu=False):
 
         device_str = "CPU" if force_cpu else "GPU (FP16)"
-        print(f"[Halo-Lipsy] v2.2 Processing {len(images)} frames @ {fps}fps on {device_str}")
+        print(f"[Halo-Lipsy] v2.4 Processing {len(images)} frames @ {fps}fps on {device_str}")
 
         checkpoint_path = self._find_checkpoint(checkpoint)
         model = self._load_model(checkpoint_path, force_cpu=force_cpu)
@@ -935,25 +900,19 @@ class HaloLipsy:
                 if p_face.shape[0] != target_h or p_face.shape[1] != target_w:
                     p_face = cv2.resize(p_face, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-                # --- Mouth-only replacement ---
+                # --- Lips-only replacement ---
                 original_face = frame[y1:y2, x1:x2]
                 mouth_mask = self._gradient_mouth_mask(target_h, target_w)
 
-                # Color match using mouth-region stats only
+                # Color match prediction to original
                 p_matched = self._color_match(p_face, original_face)
 
-                # Blend first, then sharpen only the mouth pixels
-                blended_face = (p_matched.astype(np.float32) * mouth_mask +
-                               original_face.astype(np.float32) * (1.0 - mouth_mask))
-                blended_face = blended_face.clip(0, 255).astype(np.uint8)
+                # Sharpen to compensate for 96x96 upscale blur
+                p_sharpened = self._sharpen(p_matched, strength=0.4)
 
-                # Sharpen only where mask is active (avoids artifacts in feather zone)
-                sharpened = self._sharpen(blended_face, strength=0.4)
-                mask_binary = (mouth_mask[:, :, 0] > 0.5).astype(np.float32)
-                mask_binary = cv2.GaussianBlur(mask_binary, (5, 5), 1.5)
-                mask_3ch = np.stack([mask_binary] * 3, axis=-1)
-                blended_face = (sharpened.astype(np.float32) * mask_3ch +
-                               blended_face.astype(np.float32) * (1.0 - mask_3ch))
+                # Blend: only lips from Wav2Lip, everything else untouched
+                blended_face = (p_sharpened.astype(np.float32) * mouth_mask +
+                               original_face.astype(np.float32) * (1.0 - mouth_mask))
                 blended_face = blended_face.clip(0, 255).astype(np.uint8)
 
                 # Temporal smoothing - skip when face has moved significantly
@@ -1006,7 +965,7 @@ class HaloLipsy:
 # NODE REGISTRATION
 # ============================================================================
 
-__version__ = "2.2.0"
+__version__ = "2.4.0"
 __author__ = "Brent & Claude Code"
 
 NODE_CLASS_MAPPINGS = {
