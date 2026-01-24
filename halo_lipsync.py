@@ -3,7 +3,7 @@ Halo-Lipsy: Native AMD Unified Memory Lip Sync for ComfyUI
 
 Created by: Brent & Claude Code (Anthropic Claude Opus 4.5)
 License: MIT
-Version: 1.4.0
+Version: 2.0.0
 
 Built for AMD APUs with unified memory (Strix Halo, etc.) but works everywhere.
 No subprocesses, no ghost files, no venv escapes. Just lip sync that works.
