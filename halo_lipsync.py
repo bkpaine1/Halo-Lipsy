@@ -958,16 +958,16 @@ class HaloLipsy:
 # NODE REGISTRATION
 # ============================================================================
 
+__version__ = "2.0.0"
+__author__ = "Brent & Claude Code"
+
 NODE_CLASS_MAPPINGS = {
     "HaloLipsy": HaloLipsy,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "HaloLipsy": "Halo-Lipsy",
+    "HaloLipsy": f"Halo-Lipsy v{__version__}",
 }
-
-__version__ = "2.0.0"
-__author__ = "Brent & Claude Code"
 
 # Startup message
 print(f"[Halo-Lipsy] v{__version__} Loaded - AMD unified memory lip sync by Brent & Claude Code")
