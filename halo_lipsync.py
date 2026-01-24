@@ -418,6 +418,12 @@ class HaloLipsy:
                     "tooltip": "Temporal smoothing (0 = off, 0.2 = blend 20% of previous frame mouth)"}),
                 "force_cpu": ("BOOLEAN", {"default": False,
                     "tooltip": "Run all inference on CPU (no VRAM)"}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.01,
+                    "tooltip": "Video FPS - must match your input video for correct sync"}),
+                "face_detect_interval": ("INT", {"default": 1, "min": 1, "max": 10,
+                    "tooltip": "Detect face every Nth frame (interpolate between). Higher = faster, lower = more accurate"}),
+                "temporal_smooth": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 0.5, "step": 0.05,
+                    "tooltip": "Temporal smoothing (0 = off, 0.2 = blend 20% of previous frame mouth)"}),
             }
         }
 
