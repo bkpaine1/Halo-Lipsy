@@ -391,15 +391,11 @@ class HaloLipsy:
             },
             "optional": {
                 "checkpoint": (checkpoint_options, {"default": "auto"}),
-                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.01,
-                    "tooltip": "Video FPS - must match your input video for correct sync"}),
                 "mode": (["sequential", "repetitive"], {"default": "sequential"}),
                 "trim_to_audio": ("BOOLEAN", {"default": True,
                     "tooltip": "ON = trim video to audio length, OFF = keep full video (no lip sync after audio ends)"}),
                 "face_detect_batch": ("INT", {"default": 4, "min": 1, "max": 32,
                     "tooltip": "Batch size for face detection (CPU)"}),
-                "face_detect_interval": ("INT", {"default": 1, "min": 1, "max": 10,
-                    "tooltip": "Detect face every Nth frame (interpolate between). Higher = faster, lower = more accurate"}),
                 "inference_batch": ("INT", {"default": 64, "min": 1, "max": 256,
                     "tooltip": "Batch size for Wav2Lip inference (GPU)"}),
                 "face_padding": ("INT", {"default": 10, "min": 0, "max": 50,
@@ -414,10 +410,14 @@ class HaloLipsy:
                     "tooltip": "Feather blend face edges"}),
                 "blend_radius": ("INT", {"default": 5, "min": 1, "max": 20,
                     "tooltip": "Edge blend radius in pixels"}),
-                "temporal_smooth": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 0.5, "step": 0.05,
-                    "tooltip": "Temporal smoothing (0 = off, 0.2 = blend 20% of previous frame mouth)"}),
                 "force_cpu": ("BOOLEAN", {"default": False,
                     "tooltip": "Run all inference on CPU (no VRAM)"}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.01,
+                    "tooltip": "Video FPS - must match your input video for correct sync"}),
+                "face_detect_interval": ("INT", {"default": 1, "min": 1, "max": 10,
+                    "tooltip": "Detect face every Nth frame (interpolate between). Higher = faster, lower = more accurate"}),
+                "temporal_smooth": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 0.5, "step": 0.05,
+                    "tooltip": "Temporal smoothing (0 = off, 0.2 = blend 20% of previous frame mouth)"}),
             }
         }
 
