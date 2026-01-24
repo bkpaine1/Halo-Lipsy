@@ -1,6 +1,6 @@
 [project]
 name = "Halo-Lipsy"
-version = "2.1.0"
+version = "2.2.0"
 description = "AMD unified memory lip sync for ComfyUI. Native Wav2Lip inference with no subprocesses - works on Strix Halo, ROCm, and all AMD APUs."
 authors = [
     {name = "Brent & Claude Code (Anthropic Opus 4.5)"}

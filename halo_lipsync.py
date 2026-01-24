@@ -262,11 +262,11 @@ class MediaPipeFaceDetector:
                 x2 = min(w, int((bbox.xmin + bbox.width) * w))
                 y2 = min(h, int((bbox.ymin + bbox.height) * h))
 
-                # Expand bbox for better face coverage (Wav2Lip needs forehead context)
+                # Expand bbox - minimal forehead (wastes 96px resolution), focus on mouth
                 bw, bh = x2 - x1, y2 - y1
-                expand_w = int(bw * 0.15)
-                expand_h_top = int(bh * 0.3)  # More expansion upward for forehead
-                expand_h_bot = int(bh * 0.1)
+                expand_w = int(bw * 0.10)
+                expand_h_top = int(bh * 0.15)  # Less forehead = more mouth pixels in 96x96
+                expand_h_bot = int(bh * 0.10)
 
                 x1 = max(0, x1 - expand_w)
                 y1 = max(0, y1 - expand_h_top)
@@ -402,28 +402,18 @@ class HaloLipsy:
                     "tooltip": "Detect face every Nth frame (interpolate between). Higher = faster, lower = more accurate"}),
                 "inference_batch": ("INT", {"default": 64, "min": 1, "max": 256,
                     "tooltip": "Batch size for Wav2Lip inference (GPU)"}),
-                "face_padding": ("INT", {"default": 10, "min": 0, "max": 50,
-                    "tooltip": "Padding around detected face in pixels"}),
+                "face_padding": ("INT", {"default": 5, "min": 0, "max": 50,
+                    "tooltip": "Padding around detected face in pixels (less = more mouth resolution)"}),
                 "sync_offset": ("INT", {"default": 0, "min": -10, "max": 10,
                     "tooltip": "Audio sync offset in frames (negative = audio earlier)"}),
                 "mel_step_multiplier": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05,
                     "tooltip": "Lip sync timing (>1 = faster mouth)"}),
                 "smooth_box_frames": ("INT", {"default": 5, "min": 1, "max": 15,
                     "tooltip": "Frames for smoothing face box movement"}),
-                "blend_edges": ("BOOLEAN", {"default": True,
-                    "tooltip": "Feather blend face edges"}),
-                "blend_radius": ("INT", {"default": 5, "min": 1, "max": 20,
-                    "tooltip": "Edge blend radius in pixels"}),
                 "temporal_smooth": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 0.5, "step": 0.05,
                     "tooltip": "Temporal smoothing (0 = off, 0.2 = blend 20% of previous frame mouth)"}),
                 "force_cpu": ("BOOLEAN", {"default": False,
                     "tooltip": "Run all inference on CPU (no VRAM)"}),
-                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.01,
-                    "tooltip": "Video FPS - must match your input video for correct sync"}),
-                "face_detect_interval": ("INT", {"default": 1, "min": 1, "max": 10,
-                    "tooltip": "Detect face every Nth frame (interpolate between). Higher = faster, lower = more accurate"}),
-                "temporal_smooth": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 0.5, "step": 0.05,
-                    "tooltip": "Temporal smoothing (0 = off, 0.2 = blend 20% of previous frame mouth)"}),
             }
         }
 
@@ -716,13 +706,21 @@ class HaloLipsy:
         return np.stack([mask] * 3, axis=-1)
 
     def _color_match(self, source, target):
-        """Match color/brightness of source to target using mean/std transfer"""
+        """Match color/brightness of source to target using only the mouth region stats"""
         src = source.astype(np.float32)
         tgt = target.astype(np.float32)
+        h = src.shape[0]
+
+        # Only use the mouth region (60-90% of face height) for color stats
+        # This prevents forehead/eye colors from skewing the mouth match
+        mouth_top = int(h * 0.55)
+        mouth_bot = int(h * 0.90)
 
         for c in range(3):
-            src_mean, src_std = src[:, :, c].mean(), src[:, :, c].std() + 1e-6
-            tgt_mean, tgt_std = tgt[:, :, c].mean(), tgt[:, :, c].std() + 1e-6
+            src_region = src[mouth_top:mouth_bot, :, c]
+            tgt_region = tgt[mouth_top:mouth_bot, :, c]
+            src_mean, src_std = src_region.mean(), src_region.std() + 1e-6
+            tgt_mean, tgt_std = tgt_region.mean(), tgt_region.std() + 1e-6
             src[:, :, c] = (src[:, :, c] - src_mean) * (tgt_std / src_std) + tgt_mean
 
         return np.clip(src, 0, 255).astype(np.uint8)
@@ -735,13 +733,13 @@ class HaloLipsy:
 
     def lipsync(self, images, audio, checkpoint="auto", fps=30.0, mode="sequential",
                 trim_to_audio=True, face_detect_batch=4, face_detect_interval=1,
-                inference_batch=64, face_padding=10,
+                inference_batch=64, face_padding=5,
                 sync_offset=0, mel_step_multiplier=1.0,
-                smooth_box_frames=5, blend_edges=True, blend_radius=5,
-                temporal_smooth=0.2, force_cpu=False):
+                smooth_box_frames=5, temporal_smooth=0.2, force_cpu=False,
+                blend_edges=True, blend_radius=5):
 
         device_str = "CPU" if force_cpu else "GPU (FP16)"
-        print(f"[Halo-Lipsy] v2.1 Processing {len(images)} frames @ {fps}fps on {device_str}")
+        print(f"[Halo-Lipsy] v2.2 Processing {len(images)} frames @ {fps}fps on {device_str}")
 
         checkpoint_path = self._find_checkpoint(checkpoint)
         model = self._load_model(checkpoint_path, force_cpu=force_cpu)
@@ -937,19 +935,25 @@ class HaloLipsy:
                 if p_face.shape[0] != target_h or p_face.shape[1] != target_w:
                     p_face = cv2.resize(p_face, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-                # --- Gradient mouth replacement ---
+                # --- Mouth-only replacement ---
                 original_face = frame[y1:y2, x1:x2]
                 mouth_mask = self._gradient_mouth_mask(target_h, target_w)
 
-                # Color match the model output to original
+                # Color match using mouth-region stats only
                 p_matched = self._color_match(p_face, original_face)
 
-                # Sharpen to recover detail
-                p_matched = self._sharpen(p_matched, strength=0.3)
-
-                # Apply gradient mask: blend original with model output
+                # Blend first, then sharpen only the mouth pixels
                 blended_face = (p_matched.astype(np.float32) * mouth_mask +
                                original_face.astype(np.float32) * (1.0 - mouth_mask))
+                blended_face = blended_face.clip(0, 255).astype(np.uint8)
+
+                # Sharpen only where mask is active (avoids artifacts in feather zone)
+                sharpened = self._sharpen(blended_face, strength=0.4)
+                mask_binary = (mouth_mask[:, :, 0] > 0.5).astype(np.float32)
+                mask_binary = cv2.GaussianBlur(mask_binary, (5, 5), 1.5)
+                mask_3ch = np.stack([mask_binary] * 3, axis=-1)
+                blended_face = (sharpened.astype(np.float32) * mask_3ch +
+                               blended_face.astype(np.float32) * (1.0 - mask_3ch))
                 blended_face = blended_face.clip(0, 255).astype(np.uint8)
 
                 # Temporal smoothing - skip when face has moved significantly
@@ -1002,7 +1006,7 @@ class HaloLipsy:
 # NODE REGISTRATION
 # ============================================================================
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 __author__ = "Brent & Claude Code"
 
 NODE_CLASS_MAPPINGS = {
